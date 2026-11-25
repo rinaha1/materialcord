@@ -1,0 +1,8 @@
+<resources>
+    <!-- Base application theme. -->
+    <style name="Theme.OpenCord.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground_no_shadow</item>
+        <item name="windowSplashScreenBackground">@color/ic_launcher_background</item>
+    </style>
+
+</resources>

@@ -1,0 +1,314 @@
+package com.xinto.opencord.gateway
+
+import com.github.materiiapps.partial.Partial
+import com.xinto.opencord.BuildConfig
+import com.xinto.opencord.gateway.dto.*
+import com.xinto.opencord.gateway.event.Event
+import com.xinto.opencord.gateway.event.EventDeserializationStrategy
+import com.xinto.opencord.gateway.event.ReadyEvent
+import com.xinto.opencord.gateway.event.UserSettingsUpdateEvent
+import com.xinto.opencord.gateway.io.Capabilities
+import com.xinto.opencord.gateway.io.IncomingPayload
+import com.xinto.opencord.gateway.io.OpCode
+import com.xinto.opencord.gateway.io.OutgoingPayload
+import com.xinto.opencord.manager.AccountManager
+import com.xinto.opencord.provider.PropertyProvider
+import com.xinto.opencord.rest.models.ApiSnowflake
+import com.xinto.opencord.util.Logger
+import io.ktor.client.*
+import io.ktor.client.plugins.websocket.*
+import io.ktor.websocket.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.*
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromJsonElement
+import java.io.ByteArrayOutputStream
+import java.util.zip.Inflater
+import java.util.zip.InflaterOutputStream
+import kotlin.coroutines.CoroutineContext
+
+interface DiscordGateway : CoroutineScope {
+    sealed interface State {
+        val active: Boolean
+            get() = this is Started || this is Connected
+
+        object Started : State
+        object Connected : State
+        object Disconnected : State
+        object Stopped : State
+    }
+
+    val events: SharedFlow<Event>
+    val state: SharedFlow<State>
+
+    suspend fun connect()
+    suspend fun disconnect()
+
+    suspend fun requestGuildMembers(guildId: Long)
+    suspend fun updatePresence(presence: UpdatePresence)
+}
+
+class DiscordGatewayImpl(
+    private val client: HttpClient,
+    private val json: Json,
+    private val accountManager: AccountManager,
+    private val propertyProvider: PropertyProvider,
+    private val logger: Logger
+) : DiscordGateway {
+    override val coroutineContext: CoroutineContext
+        get() = SupervisorJob() + Dispatchers.Default
+
+    private lateinit var webSocketSession: DefaultClientWebSocketSession
+    private lateinit var zlibInflater: Inflater
+
+    private val _events = MutableSharedFlow<Event>()
+    override val events = _events.asSharedFlow()
+
+    private val _state = MutableSharedFlow<DiscordGateway.State>(replay = 1)
+    override val state = _state.asSharedFlow()
+
+    private var resumable: Boolean = false
+    private var sequenceNumber: Int = 0
+    private lateinit var sessionId: String
+
+    init {
+        onEvent<ReadyEvent> {
+            val newAuthToken = it.data.newAuthToken
+                ?: return@onEvent
+
+            accountManager.currentAccountToken = newAuthToken
+            accountManager.locale = it.data.userSettings.locale
+        }
+
+        onEvent<UserSettingsUpdateEvent> {
+            val locale = it.data.locale
+
+            if (locale is Partial.Value) {
+                accountManager.locale = locale.value
+            }
+        }
+    }
+
+    override suspend fun connect() {
+        if (_state.replayCache.lastOrNull()?.active == true)
+            return
+
+        _state.emit(DiscordGateway.State.Started)
+
+        resumable = false // TODO: add session resuming
+        sequenceNumber = 0
+        sessionId = ""
+        zlibInflater = Inflater()
+
+        try {
+            webSocketSession = client.webSocketSession(BuildConfig.URL_GATEWAY)
+
+            sendIdentification()
+            _state.emit(DiscordGateway.State.Connected)
+            listenToSocket()
+
+            val reason = withTimeoutOrNull(2000L) {
+                webSocketSession.closeReason.await()
+            }
+
+            if (reason != null) {
+                val closeCode = CloseCode.fromValue(reason.code.toInt())
+                resumable = closeCode.canReconnect
+            }
+
+            _state.emit(DiscordGateway.State.Stopped)
+        } catch (t: Throwable) {
+            logger.error("Gateway", "Failed to connect to gateway", t)
+        }
+    }
+
+    override suspend fun disconnect() {
+        if (_state.replayCache.lastOrNull()?.active == false)
+            return
+
+        logger.debug("Gateway", "Disconnecting")
+        webSocketSession.close()
+        _state.emit(DiscordGateway.State.Disconnected)
+    }
+
+    private suspend fun listenToSocket() {
+        webSocketSession.incoming.receiveAsFlow().buffer(Channel.UNLIMITED).map { frame ->
+            val jsonString = when (frame) {
+                is Frame.Text -> frame.readText()
+                is Frame.Binary -> {
+                    val deflatedStream = ByteArrayOutputStream()
+                    InflaterOutputStream(deflatedStream, zlibInflater)
+                        .use { it.write(frame.data) }
+                    deflatedStream.use { String(it.toByteArray()) }
+                }
+                else -> null
+            }
+            jsonString?.let { str ->
+                logger.debug("Gateway", "Inbound: $str")
+                try {
+                    json.decodeFromString<IncomingPayload>(str)
+                } catch (e: Exception) {
+                    logger.error("Gateway", "Failed to decode payload", e)
+                    null
+                }
+            }
+        }.filterNotNull().collect { incomingPayload ->
+            val (opCode, data, seqNum, eventName) = incomingPayload
+
+            if (seqNum != null)
+                sequenceNumber = seqNum
+
+            when (opCode) {
+                OpCode.Dispatch -> {
+                    try {
+                        json.decodeFromJsonElement(
+                            EventDeserializationStrategy(eventName!!),
+                            data!!,
+                        ).let { decodedEvent ->
+                            if (decodedEvent is ReadyEvent) {
+                                sessionId = decodedEvent.data.sessionId
+                            }
+                            _events.emit(decodedEvent)
+                        }
+                    } catch (e: Exception) {
+                        logger.error("Gateway", "Failed to decode event data", e)
+                    }
+                }
+                OpCode.Heartbeat -> {}
+                OpCode.Reconnect -> {}
+                OpCode.Hello -> {
+                    launch {
+                        val interval =
+                            json.decodeFromJsonElement<Heartbeat>(data!!).heartbeatInterval
+                        runHeartbeat(interval, initial = true)
+                    }
+                }
+                OpCode.InvalidSession -> {
+                    val canResume = json.decodeFromJsonElement<Boolean>(data!!)
+                    if (canResume) {
+                        sendResume()
+                    }
+                    logger.debug("Gateway", "Invalid Session, canResume: $canResume")
+                }
+                OpCode.HeartbeatAck -> {
+                    logger.info("Gateway", "Heartbeat Acked!")
+                }
+                else -> {}
+            }
+        }
+    }
+
+    private tailrec suspend fun runHeartbeat(
+        interval: Long,
+        initial: Boolean = false
+    ) {
+        val delay = if (initial) (interval * Math.random()).toLong() else interval
+        delay(delay)
+        sendHeartbeat()
+        runHeartbeat(interval)
+    }
+
+    private suspend fun sendHeartbeat() {
+        sendPayload(
+            opCode = OpCode.Heartbeat,
+            data = sequenceNumber,
+        )
+    }
+
+    private suspend fun sendIdentification() {
+        sendPayload(
+            opCode = OpCode.Identify,
+            data = Identification(
+                token = accountManager.currentAccountToken!!,
+                capabilities = arrayOf(
+                    Capabilities.LAZY_USER_NOTES,
+                    Capabilities.NO_AFFINE_USER_IDS,
+                    Capabilities.VERSIONED_READ_STATES,
+                    Capabilities.VERSIONED_USER_GUILD_SETTINGS,
+                    Capabilities.DEDUPLICATE_USER_OBJECTS,
+                    Capabilities.MULTIPLE_GUILD_EXPERIMENT_POPULATIONS,
+                    Capabilities.AUTH_TOKEN_REFRESH,
+                ).fold(0) { a, b -> a or b.value },
+                largeThreshold = 100,
+                compress = true,
+                properties = propertyProvider.identificationProperties,
+                clientState = IdentificationClientState(
+                    guildHashes = emptyMap(),
+                    highestLastMessageId = 0,
+                    readStateVersion = -1,
+                    userGuildSettingsVersion = -1,
+                ),
+            ),
+        )
+    }
+
+    private suspend fun sendResume() {
+        sendPayload(
+            opCode = OpCode.Resume,
+            data = Resume(
+                token = accountManager.currentAccountToken!!,
+                sessionId = sessionId,
+                sequenceNumber = sequenceNumber,
+            ),
+        )
+    }
+
+    private suspend inline fun <reified T> sendPayload(opCode: OpCode, data: T?) {
+        sendSerializedData(
+            OutgoingPayload(
+                opCode = opCode,
+                data = data,
+            ),
+        )
+    }
+
+    private suspend inline fun <reified T> sendSerializedData(data: T) {
+        val json = json.encodeToString(data)
+        logger.debug("Gateway", "Outbound: $json")
+        webSocketSession.send(Frame.Text(json))
+    }
+
+    override suspend fun requestGuildMembers(guildId: Long) {
+        sendPayload(
+            opCode = OpCode.RequestGuildMembers,
+            data = RequestGuildMembers(
+                guildId = ApiSnowflake(guildId),
+            ),
+        )
+    }
+
+    override suspend fun updatePresence(presence: UpdatePresence) {
+        sendPayload(
+            opCode = OpCode.PresenceUpdate,
+            data = presence,
+        )
+    }
+}
+
+inline fun <reified E : Event> DiscordGateway.onEvent(
+    noinline filterPredicate: suspend (E) -> Boolean = { true },
+    crossinline block: suspend (E) -> Unit
+) {
+    events.buffer(Channel.UNLIMITED)
+        .filterIsInstance<E>()
+        .filter(filterPredicate)
+        .onEach {
+            launch {
+                block(it)
+            }
+        }.launchIn(this)
+}
+
+inline fun DiscordGateway.scheduleOnConnection(
+    crossinline block: suspend () -> Unit
+) {
+    state.buffer(Channel.UNLIMITED)
+        .onEach {
+            if (it is DiscordGateway.State.Connected) {
+                block()
+            }
+        }.launchIn(this)
+}

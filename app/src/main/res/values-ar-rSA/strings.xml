@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="navigation_back">عودة</string>
+    <string name="nav_open_friends">فتح قائمة الاصدقاء</string>
+    <string name="nav_open_search">فتح بحث القناة</string>
+    <string name="nav_open_mentions">عرض إشارات عامة</string>
+    <string name="login_landing_title">مرحبا بك في OpenCord!</string>
+    <string name="login_landing_subtitle">انضم إلى أكثر من 0 من الأشخاص الذين يستخدمون OpenCord كبديل لتطبيق stock Discord.</string>
+    <string name="login_login_title">مرحبا بعودتك!</string>
+    <string name="login_login_subtitle">نحن متحمسون جدا لرؤيتك مرة أخرى!</string>
+    <string name="login_action_login">تسجيل دخول</string>
+    <string name="login_action_register">تسجيل</string>
+    <string name="login_field_username">البريد الإلكتروني أو رقم الهاتف</string>
+    <string name="login_field_password">كلمة المرور</string>
+    <string name="login_mfa_title">مطلوب مصادقة ثنائية!</string>
+    <string name="login_mfa_code">مصادقة ثنائية أو رمز النسخ الاحتياطي</string>
+    <string name="login_mfa_confirm">تأكيد</string>
+    <string name="login_mfa_cancel">إلغاء</string>
+    <string name="chat_title">#%1$s</string>
+    <string name="chat_unselected_message">يرجى اختيار قناة.</string>
+    <string name="chat_input_hint">رسالة #%1$s</string>
+    <string name="chat_loading_error">حدث خطأ أثناء تحميل الدردشة.</string>
+    <string name="chat_bot_label">بوت</string>
+    <string name="channel_unselected_message">الرجاء تحديد جماعة.</string>
+    <string name="channels_collapse_category">إغلاق الفئة</string>
+    <string name="pins_title">الرسائل المثبتة</string>
+    <string name="pins_loading_error">حدث خطأ أثناء تحميل الرسائل المثبتة.</string>
+    <string name="settings_title">الإعدادات</string>
+    <string name="settings_open">فتح الإعدادات</string>
+    <string name="timestamp_tomorrow">غدا عند %1$s</string>
+    <string name="timestamp_today">اليوم عند %1$s</string>
+    <string name="timestamp_yesterday">أمس عند %1$s</string>
+    <string name="message_reply_unknown">رسالة غير معروفة.</string>
+    <string name="guilds_home">الصفحة الرئيسية</string>
+    <string name="guild_boost_level">مستوى تعزيز الخادم</string>
+    <string name="current_user_set_status">تعيين حالة مخصصة</string>
+    <string name="current_user_clear_status">مسح الحالة</string>
+    <string name="accounts_open">فتح مبدل الحساب</string>
+</resources>
